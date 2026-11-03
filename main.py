@@ -11,6 +11,7 @@ Flow:
 Koi download nahi hota, sirf forward.
 """
 import asyncio
+import glob
 import html
 import io
 import json
@@ -18,6 +19,7 @@ import logging
 import os
 import re
 
+import aiohttp
 import qrcode
 from aiohttp import web
 from telethon import Button, TelegramClient, events
@@ -45,6 +47,8 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 OWNER_ID = int(os.environ["OWNER_ID"])
 MONGO_URI = os.getenv("MONGO_URI")  # recommended on Render (free disk nahi hoti)
 PORT = int(os.getenv("PORT", "10000"))
+POSTER_BOT_TOKEN = os.getenv("POSTER_BOT_TOKEN")  # bulk ke liye (poster bot ka token)
+BACKUP_FILE = os.getenv("BACKUP_FILE")  # default: repo ki autobackup-*.json
 DATA_FILE = "data.json"
 
 DEFAULTS = {"target": "diskwala_576_bot", "backup": None, "timeout": 180, "session": ""}
@@ -434,6 +438,89 @@ async def worker():
             queue.task_done()
 
 
+# ───────────────────────── Bulk (backup JSON -> queue) ─────────────────────────
+bulk_task = None
+
+
+async def tell(text):
+    try:
+        await bot.send_message(OWNER_ID, text, parse_mode="html")
+    except Exception:
+        pass
+
+
+async def bulk_run(chat_id):
+    """Backup JSON ke posts ek-ek karke isi bot ke queue me daalta hai (resume-able)."""
+    try:
+        if not POSTER_BOT_TOKEN:
+            return await tell("❌ Render env <b>POSTER_BOT_TOKEN</b> set nahi hai.")
+        if not await is_logged() or not store.data["backup"]:
+            return await tell("❌ Pehle QR Login aur Backup Channel set karo.")
+        path = BACKUP_FILE or (sorted(glob.glob("autobackup-*.json")) or [None])[-1]
+        if not path or not os.path.exists(path):
+            return await tell("❌ Backup JSON file repo me nahi mili.")
+        with open(path, encoding="utf-8") as f:
+            posts = json.load(f)["posts"].get(str(chat_id), [])
+        posts = [p for p in posts if p.get("active", True) and "diskwala.com/app/" in (p.get("caption") or "")]
+        b = store.data.get("bulk") or {}
+        done = set(b.get("done", [])) if str(b.get("chat_id")) == str(chat_id) else set()
+        todo = [p for p in posts if p["_id"] not in done]
+        await store.set(bulk={"chat_id": str(chat_id), "running": True, "done": sorted(done)})
+        await tell(f"🚀 <b>Bulk start</b>: {len(todo)} baaki / {len(posts)} total")
+
+        async with aiohttp.ClientSession() as http:
+            async with http.get(f"https://api.telegram.org/bot{POSTER_BOT_TOKEN}/getMe") as r:
+                poster = (await r.json())["result"]["username"]
+            poster_ent = await user.get_entity(poster)
+            control = await user.get_entity((await bot.get_me()).username)
+            methods = {"video": ("sendVideo", "video"), "photo": ("sendPhoto", "photo"),
+                       "animation": ("sendAnimation", "animation"), "document": ("sendDocument", "document")}
+
+            for n, p in enumerate(todo, 1):
+                if not store.data["bulk"].get("running"):
+                    return await tell(f"⏹ Bulk ruk gaya. {len(done)}/{len(posts)} ho chuke.")
+                m = methods.get(p.get("media_type"))
+                if m and p.get("file_id"):
+                    payload = {"chat_id": OWNER_ID, m[1]: p["file_id"], "caption": p.get("caption") or "",
+                               "parse_mode": p.get("parse_mode") or "HTML"}
+                    async with http.post(f"https://api.telegram.org/bot{POSTER_BOT_TOKEN}/{m[0]}", json=payload) as r:
+                        data = await r.json()
+                    if data.get("ok"):
+                        await asyncio.sleep(1.5)
+                        msgs = await user.get_messages(poster_ent, limit=1)
+                        c0 = state["counter"]
+                        await user.forward_messages(control, msgs[0])
+                        for _ in range(30):  # job queue me aane tak
+                            if state["counter"] > c0:
+                                break
+                            await asyncio.sleep(1)
+                        while state["jobs"]:  # job khatam hone tak
+                            if not store.data["bulk"].get("running"):
+                                break
+                            await asyncio.sleep(3)
+                    else:
+                        log.warning("poster send fail: %s", data.get("description"))
+                done.add(p["_id"])
+                await store.set(bulk={"chat_id": str(chat_id), "running": True, "done": sorted(done)})
+                if n % 50 == 0:
+                    await tell(f"📊 {len(done)}/{len(posts)} ho gaye")
+                await asyncio.sleep(2)
+
+        await store.set(bulk={"chat_id": str(chat_id), "running": False, "done": sorted(done)})
+        await tell(f"✅ <b>Bulk complete</b>: {len(done)}/{len(posts)}")
+    except Exception as e:
+        log.exception("bulk failed")
+        await tell(f"❌ Bulk error:\n<code>{html.escape(str(e))}</code>\n/bulk dobara bhejo, resume ho jayega.")
+
+
+async def bulk_start(chat_id):
+    global bulk_task
+    if bulk_task and not bulk_task.done():
+        return False
+    bulk_task = asyncio.create_task(bulk_run(chat_id))
+    return True
+
+
 # ───────────────────────── Bot handlers ─────────────────────────
 async def handle_post(event):
     msg = event.message
@@ -471,6 +558,28 @@ async def on_message(event):
         return
     text = (event.raw_text or "").strip()
     mode = state["mode"]
+
+    if text.startswith("/bulkstop"):
+        b = dict(store.data.get("bulk") or {})
+        b["running"] = False
+        await store.set(bulk=b)
+        await event.reply("⏹ Bulk rokne ka signal bhej diya (current post khatam hone par ruk jayega).")
+        return
+
+    if text.startswith("/bulkstatus"):
+        b = store.data.get("bulk") or {}
+        await event.reply(f"📊 chat {b.get('chat_id')}: {len(b.get('done', []))} done, running={b.get('running')}")
+        return
+
+    if text.startswith("/bulk"):
+        parts = text.split()
+        cid = parts[1] if len(parts) > 1 else (store.data.get("bulk") or {}).get("chat_id")
+        if not cid:
+            await event.reply("Use: <code>/bulk -1004471150773</code>", parse_mode="html")
+            return
+        ok = await bulk_start(cid)
+        await event.reply("🚀 Bulk shuru ho raha hai…" if ok else "⚠️ Bulk pehle se chal raha hai.")
+        return
 
     if text.startswith("/"):
         await render()
@@ -664,6 +773,9 @@ async def main():
         state["dialogs"] = True
 
     asyncio.create_task(worker())
+    b = store.data.get("bulk") or {}
+    if b.get("running") and b.get("chat_id"):
+        await bulk_start(b["chat_id"])  # restart ke baad auto-resume
     try:
         await render()
     except Exception:
