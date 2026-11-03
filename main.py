@@ -51,6 +51,9 @@ DEFAULTS = {"target": "diskwala_576_bot", "backup": None, "timeout": 180, "sessi
 URL_RE = re.compile(r"https?://[^\s<>\"']+")
 # Sirf ye pattern copy hoga. Badalna ho to LINK_PATTERN env var set karo.
 LINK_RE = re.compile(os.getenv("LINK_PATTERN", r"https?://(?:www\.)?diskwala\.com/app/[A-Za-z0-9]+"))
+# Target bot ye message bheje ("Sorry! Download fail ho gaya...") to link skip. SKIP_PATTERN se badlo.
+FAIL_RE = re.compile(os.getenv("SKIP_PATTERN", r"download\s*fail"), re.I)
+FAIL, CANCEL = "FAIL", "CANCEL"
 
 bot: TelegramClient = None
 user: TelegramClient = None
@@ -64,6 +67,9 @@ state = {
     "dialogs": False,
     "target_id": None,
     "inbox": None,
+    "jobs": {},
+    "counter": 0,
+    "current": None,
 }
 
 
@@ -322,6 +328,8 @@ async def on_user_message(ev):
     m = ev.message
     if m.video or (m.document and not m.sticker):
         state["inbox"].put_nowait(m)
+    elif FAIL_RE.search(m.raw_text or ""):
+        state["inbox"].put_nowait(FAIL)
 
 
 def make_user(session=""):
@@ -331,12 +339,18 @@ def make_user(session=""):
 
 
 # ───────────────────────── Worker ─────────────────────────
-async def run_job(msg, st):
+async def run_job(msg, st, job):
+    def cancel_btn():
+        return [[Button.inline("❌ Cancel", f"cancel_{job['id']}".encode())]]
+
     async def status(text, buttons=None):
         try:
             await st.edit(text, buttons=buttons, parse_mode="html")
         except Exception:
             pass
+
+    async def cancelled():
+        await status("🛑 <b>Cancel ho gaya.</b>\nKuch forward nahi hua.", [home_btn()])
 
     links = extract_links(msg)
     target = store.data["target"]
@@ -344,20 +358,36 @@ async def run_job(msg, st):
     ent = await user.get_entity(target)
     state["target_id"] = ent.id
 
-    videos, failed = [], []
+    videos, skipped = [], []
     for i, link in enumerate(links, 1):
-        await status(f"⏳ <b>Link {i}/{len(links)}</b> target bot ko bheja\nVideo ka wait ho raha hai…")
+        if job["cancelled"]:
+            return await cancelled()
+        await status(
+            f"⏳ <b>Link {i}/{len(links)}</b> target bot ko bheja\nVideo ka wait ho raha hai…",
+            cancel_btn(),
+        )
         while not state["inbox"].empty():
             state["inbox"].get_nowait()
         await user.send_message(ent, link)
         try:
-            videos.append(await asyncio.wait_for(state["inbox"].get(), timeout))
+            res = await asyncio.wait_for(state["inbox"].get(), timeout)
         except asyncio.TimeoutError:
-            failed.append(link)
+            skipped.append("timeout")
+            continue
+        if res == CANCEL or job["cancelled"]:
+            return await cancelled()
+        if res == FAIL:
+            skipped.append("download fail")
+            continue
+        videos.append(res)
+
+    if job["cancelled"]:
+        return await cancelled()
 
     if not videos:
         await status(
-            f"⚠️ <b>Video nahi mila</b>\n{timeout}s me @{html.escape(target)} ne koi video nahi bheja.",
+            "⚠️ <b>Koi video nahi mila</b>\n"
+            f"⏭ {len(skipped)} link skip hue ({', '.join(sorted(set(skipped)))}).",
             [home_btn()],
         )
         return
@@ -370,17 +400,22 @@ async def run_job(msg, st):
         await asyncio.sleep(1)
 
     text = f"✅ <b>Backup complete!</b>\n📝 1 post + 🎬 {len(videos)} video forward ho gaye."
-    if failed:
-        text += f"\n\n⚠️ {len(failed)} link ka video nahi aaya (timeout)."
+    if skipped:
+        text += f"\n\n⏭ {len(skipped)} link skip hue ({', '.join(sorted(set(skipped)))})."
     await status(text, [home_btn()])
 
 
 async def worker():
     while True:
-        msg, st = await queue.get()
+        msg, st, job = await queue.get()
+        if job["cancelled"]:
+            state["jobs"].pop(job["id"], None)
+            queue.task_done()
+            continue
         state["busy"] = True
+        state["current"] = job["id"]
         try:
-            await run_job(msg, st)
+            await run_job(msg, st, job)
         except Exception as e:
             log.exception("job failed")
             try:
@@ -394,6 +429,8 @@ async def worker():
                 pass
         finally:
             state["busy"] = False
+            state["current"] = None
+            state["jobs"].pop(job["id"], None)
             queue.task_done()
 
 
@@ -419,11 +456,14 @@ async def handle_post(event):
             parse_mode="html",
         )
         return
+    state["counter"] += 1
+    job = {"id": state["counter"], "cancelled": False}
+    state["jobs"][job["id"]] = job
     st = await event.reply(
         f"📥 Queue me add ho gaya (#{queue.qsize() + (1 if state['busy'] else 0) + 1})",
-        buttons=[home_btn()],
+        buttons=[[Button.inline("❌ Cancel", f"cancel_{job['id']}".encode())], home_btn()],
     )
-    await queue.put((msg, st))
+    await queue.put((msg, st, job))
 
 
 async def on_message(event):
@@ -495,6 +535,24 @@ async def on_callback(event):
     if d == "menu":
         await event.answer()
         await render(event)
+
+    elif d.startswith("cancel_"):
+        job = state["jobs"].get(int(d[7:]))
+        if not job:
+            await event.answer("Ye job already khatam ho chuka hai", alert=True)
+            return
+        job["cancelled"] = True
+        if state["current"] == job["id"]:
+            state["inbox"].put_nowait(CANCEL)
+        await event.answer("Cancel kar diya 🛑")
+        try:
+            await event.edit(
+                "🛑 <b>Cancel ho gaya.</b>\nKuch forward nahi hua.",
+                buttons=[home_btn()],
+                parse_mode="html",
+            )
+        except Exception:
+            pass
 
     elif d == "guide":
         await event.edit(GUIDE, buttons=[home_btn()], parse_mode="html")
