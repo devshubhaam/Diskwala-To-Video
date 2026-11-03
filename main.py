@@ -49,6 +49,8 @@ DATA_FILE = "data.json"
 
 DEFAULTS = {"target": "diskwala_576_bot", "backup": None, "timeout": 180, "session": ""}
 URL_RE = re.compile(r"https?://[^\s<>\"']+")
+# Sirf ye pattern copy hoga. Badalna ho to LINK_PATTERN env var set karo.
+LINK_RE = re.compile(os.getenv("LINK_PATTERN", r"https?://(?:www\.)?diskwala\.com/app/[A-Za-z0-9]+"))
 
 bot: TelegramClient = None
 user: TelegramClient = None
@@ -172,6 +174,8 @@ def extract_links(msg):
         pass
     links += URL_RE.findall(msg.raw_text or "")
     links = [l.rstrip(".,;)]}>") for l in links]
+    # sirf diskwala.com/app/<id> wale links, baaki sab ignore
+    links = [l for l in links if LINK_RE.match(l)]
     return list(dict.fromkeys(links))
 
 
@@ -409,7 +413,11 @@ async def handle_post(event):
         )
         return
     if not extract_links(msg):
-        await event.reply("🔗 Is post me koi link nahi mila.", buttons=[home_btn()])
+        await event.reply(
+            "🔗 Is post me <b>diskwala.com/app/…</b> wala link nahi mila.",
+            buttons=[home_btn()],
+            parse_mode="html",
+        )
         return
     st = await event.reply(
         f"📥 Queue me add ho gaya (#{queue.qsize() + (1 if state['busy'] else 0) + 1})",
