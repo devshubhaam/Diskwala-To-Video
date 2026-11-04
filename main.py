@@ -17,7 +17,9 @@ import io
 import json
 import logging
 import os
+import random
 import re
+import time
 
 import aiohttp
 import qrcode
@@ -29,6 +31,7 @@ from telethon.errors import (
     SessionPasswordNeededError,
 )
 from telethon.sessions import StringSession
+from telethon.tl import functions
 from telethon.tl.types import (
     Channel,
     InputPeerChannel,
@@ -57,7 +60,12 @@ URL_RE = re.compile(r"https?://[^\s<>\"']+")
 LINK_RE = re.compile(os.getenv("LINK_PATTERN", r"https?://(?:www\.)?diskwala\.com/app/[A-Za-z0-9]+"))
 # Target bot ye message bheje ("Sorry! Download fail ho gaya...") to link skip. SKIP_PATTERN se badlo.
 FAIL_RE = re.compile(os.getenv("SKIP_PATTERN", r"download\s*fail"), re.I)
-FAIL, CANCEL = "FAIL", "CANCEL"
+FAIL, CANCEL, DEAD = "FAIL", "CANCEL", "DEAD"
+DEAD_RE = re.compile(os.getenv("DEAD_PATTERN", r"link\s*kaam\s*nahi|galat\s*ya\s*remove"), re.I)
+RETRY_HOURS = float(os.getenv("RETRY_HOURS", "3"))  # fail hue posts ka auto-retry (0 = sirf manual /bulkretry)
+# Termux se pehle hi ho chuke 5 posts (reset ke baad dobara na ho)
+SEED_DONE = ["6a6aeba797e52936a7479545", "6a6aeba897e52936a7479546", "6a6aebcc97e52936a7479562",
+             "6a6aebd997e52936a747956c", "6a6aebe697e52936a7479576"]
 
 bot: TelegramClient = None
 user: TelegramClient = None
@@ -325,15 +333,19 @@ async def do_login():
 
 # ───────────────────────── Userbot ─────────────────────────
 async def on_user_message(ev):
-    """Target bot ka video/file inbox me daalo."""
+    """Target bot ka video/file inbox me daalo (reply_to id ke saath, taaki purane link ka result na mile)."""
     tid = state["target_id"]
     if tid is None or ev.sender_id != tid:
         return
     m = ev.message
+    rt = m.reply_to_msg_id
+    txt = m.raw_text or ""
     if m.video or (m.document and not m.sticker):
-        state["inbox"].put_nowait(m)
-    elif FAIL_RE.search(m.raw_text or ""):
-        state["inbox"].put_nowait(FAIL)
+        state["inbox"].put_nowait((rt, m))
+    elif DEAD_RE.search(txt):
+        state["inbox"].put_nowait((rt, DEAD))
+    elif FAIL_RE.search(txt):
+        state["inbox"].put_nowait((rt, FAIL))
 
 
 def make_user(session=""):
@@ -343,6 +355,35 @@ def make_user(session=""):
 
 
 # ───────────────────────── Worker ─────────────────────────
+async def fwd(client, msg, to_peer, drop_caps=False):
+    """Server-side forward (bandwidth 0): 'Forwarded from' tag nahi, optional caption hata ke."""
+    await client(functions.messages.ForwardMessagesRequest(
+        from_peer=await msg.get_input_chat(),
+        id=[msg.id],
+        random_id=[random.randrange(-2**63, 2**63)],
+        to_peer=to_peer,
+        drop_author=True,
+        drop_media_captions=drop_caps,
+    ))
+
+
+async def wait_result(sent_id, timeout):
+    """Isi link ka result lo; purane (timeout hue) links ke late replies ignore."""
+    loop = asyncio.get_event_loop()
+    end = loop.time() + timeout
+    while True:
+        left = end - loop.time()
+        if left <= 0:
+            raise asyncio.TimeoutError
+        item = await asyncio.wait_for(state["inbox"].get(), left)
+        if item == CANCEL:
+            return CANCEL
+        rt, payload = item
+        if rt is not None and rt != sent_id:
+            continue  # stale
+        return payload
+
+
 async def run_job(msg, st, job):
     def cancel_btn():
         return [[Button.inline("❌ Cancel", f"cancel_{job['id']}".encode())]]
@@ -372,9 +413,9 @@ async def run_job(msg, st, job):
         )
         while not state["inbox"].empty():
             state["inbox"].get_nowait()
-        await user.send_message(ent, link)
+        sent = await user.send_message(ent, link)
         try:
-            res = await asyncio.wait_for(state["inbox"].get(), timeout)
+            res = await wait_result(sent.id, timeout)
         except asyncio.TimeoutError:
             skipped.append("timeout")
             continue
@@ -383,12 +424,17 @@ async def run_job(msg, st, job):
         if res == FAIL:
             skipped.append("download fail")
             continue
+        if res == DEAD:
+            skipped.append("link dead")
+            continue
         videos.append(res)
 
     if job["cancelled"]:
         return await cancelled()
 
+    job["why"] = ", ".join(sorted(set(skipped)))
     if not videos:
+        job["result"] = "failed"
         await status(
             "⚠️ <b>Koi video nahi mila</b>\n"
             f"⏭ {len(skipped)} link skip hue ({', '.join(sorted(set(skipped)))}).",
@@ -397,12 +443,13 @@ async def run_job(msg, st, job):
         return
 
     await status("📤 Backup channel me forward ho raha hai…")
-    await bot.forward_messages(await bot_peer(), msg)
+    await fwd(bot, msg, await bot_peer())  # post: caption rahega, tag nahi
     peer = await user_peer()
     for v in videos:
-        await user.forward_messages(peer, v)
+        await fwd(user, v, peer, drop_caps=True)  # video: caption + tag dono nahi
         await asyncio.sleep(1)
 
+    job["result"] = "done"
     text = f"✅ <b>Backup complete!</b>\n📝 1 post + 🎬 {len(videos)} video forward ho gaye."
     if skipped:
         text += f"\n\n⏭ {len(skipped)} link skip hue ({', '.join(sorted(set(skipped)))})."
@@ -413,6 +460,7 @@ async def worker():
     while True:
         msg, st, job = await queue.get()
         if job["cancelled"]:
+            job["result"] = "cancelled"
             state["jobs"].pop(job["id"], None)
             queue.task_done()
             continue
@@ -421,6 +469,8 @@ async def worker():
         try:
             await run_job(msg, st, job)
         except Exception as e:
+            job["result"] = "error"
+            job["why"] = str(e)[:80]
             log.exception("job failed")
             try:
                 await st.edit(
@@ -449,24 +499,71 @@ async def tell(text):
         pass
 
 
-async def bulk_run(chat_id):
-    """Backup JSON ke posts ek-ek karke isi bot ke queue me daalta hai (resume-able)."""
+def bulk_get():
+    b = dict(store.data.get("bulk") or {})
+    b.setdefault("done", [])
+    b.setdefault("failed", {})  # post_id -> reason
+    return b
+
+
+def load_posts(chat_id):
+    path = BACKUP_FILE or (sorted(glob.glob("autobackup-*.json")) or [None])[-1]
+    if not path or not os.path.exists(path):
+        return None
+    with open(path, encoding="utf-8") as f:
+        posts = json.load(f)["posts"].get(str(chat_id), [])
+    return [p for p in posts if p.get("active", True) and "diskwala.com/app/" in (p.get("caption") or "")]
+
+
+def bulk_summary(b, total):
+    why = {}
+    for r in b["failed"].values():
+        for w in (r or "?").split(", "):
+            why[w] = why.get(w, 0) + 1
+    w = ", ".join(f"{k}: {v}" for k, v in sorted(why.items())) or "-"
+    return f"✅ done {len(b['done'])}/{total} · ❌ failed {len(b['failed'])} ({w})"
+
+
+def parse_bulk_args(text):
+    """'/bulk 10' -> (None, 10) · '/bulk -1004471150773 10' -> ('-1004471150773', 10)"""
+    cid, cnt = None, None
+    for t in text.split()[1:]:
+        if t.lstrip("-").isdigit():
+            if t.startswith("-") or len(t) > 6:
+                cid = t
+            else:
+                cnt = int(t) or None
+    return cid, cnt
+
+
+async def bulk_run(chat_id, mode="main"):
+    """mode=main: jo na done na failed. mode=retry: sirf failed wale."""
     try:
         if not POSTER_BOT_TOKEN:
             return await tell("❌ Render env <b>POSTER_BOT_TOKEN</b> set nahi hai.")
         if not await is_logged() or not store.data["backup"]:
             return await tell("❌ Pehle QR Login aur Backup Channel set karo.")
-        path = BACKUP_FILE or (sorted(glob.glob("autobackup-*.json")) or [None])[-1]
-        if not path or not os.path.exists(path):
+        posts = load_posts(chat_id)
+        if posts is None:
             return await tell("❌ Backup JSON file repo me nahi mili.")
-        with open(path, encoding="utf-8") as f:
-            posts = json.load(f)["posts"].get(str(chat_id), [])
-        posts = [p for p in posts if p.get("active", True) and "diskwala.com/app/" in (p.get("caption") or "")]
-        b = store.data.get("bulk") or {}
-        done = set(b.get("done", [])) if str(b.get("chat_id")) == str(chat_id) else set()
-        todo = [p for p in posts if p["_id"] not in done]
-        await store.set(bulk={"chat_id": str(chat_id), "running": True, "done": sorted(done)})
-        await tell(f"🚀 <b>Bulk start</b>: {len(todo)} baaki / {len(posts)} total")
+        b = bulk_get()
+        done = set(b["done"])
+        failed = dict(b["failed"])
+        if mode == "retry":
+            todo = [p for p in posts if p["_id"] in failed and p["_id"] not in done]
+        else:
+            todo = [p for p in posts if p["_id"] not in done and p["_id"] not in failed]
+
+        stop_at = b.get("stop_at")  # itne done hote hi ruk jao (None = sab)
+
+        async def save(running=True, retry_at=None):
+            await store.set(bulk={"chat_id": str(chat_id), "running": running, "mode": mode,
+                                  "done": sorted(done), "failed": failed, "retry_at": retry_at,
+                                  "stop_at": stop_at})
+
+        await save()
+        lim = f" · limit: {stop_at - len(done)} download" if stop_at else ""
+        await tell(f"🚀 <b>Bulk {mode}</b>: {len(todo)} posts{lim} · {bulk_summary(bulk_get(), len(posts))}")
 
         async with aiohttp.ClientSession() as http:
             async with http.get(f"https://api.telegram.org/bot{POSTER_BOT_TOKEN}/getMe") as r:
@@ -477,8 +574,13 @@ async def bulk_run(chat_id):
                        "animation": ("sendAnimation", "animation"), "document": ("sendDocument", "document")}
 
             for n, p in enumerate(todo, 1):
-                if not store.data["bulk"].get("running"):
-                    return await tell(f"⏹ Bulk ruk gaya. {len(done)}/{len(posts)} ho chuke.")
+                if not (store.data.get("bulk") or {}).get("running"):
+                    await save(running=False)
+                    return await tell(f"⏹ Bulk ruk gaya. {bulk_summary(bulk_get(), len(posts))}")
+                if stop_at and len(done) >= stop_at:
+                    break
+                pid = p["_id"]
+                result, why = "failed", "send fail"
                 m = methods.get(p.get("media_type"))
                 if m and p.get("file_id"):
                     payload = {"chat_id": OWNER_ID, m[1]: p["file_id"], "caption": p.get("caption") or "",
@@ -490,35 +592,74 @@ async def bulk_run(chat_id):
                         msgs = await user.get_messages(poster_ent, limit=1)
                         c0 = state["counter"]
                         await user.forward_messages(control, msgs[0])
+                        job = None
                         for _ in range(30):  # job queue me aane tak
                             if state["counter"] > c0:
+                                job = state["jobs"].get(state["counter"]) or {"id": state["counter"]}
                                 break
                             await asyncio.sleep(1)
-                        while state["jobs"]:  # job khatam hone tak
-                            if not store.data["bulk"].get("running"):
-                                break
-                            await asyncio.sleep(3)
+                        if job is None:
+                            why = "queue me nahi aaya"
+                        else:
+                            while job["id"] in state["jobs"]:  # job khatam hone tak
+                                if not (store.data.get("bulk") or {}).get("running"):
+                                    break
+                                await asyncio.sleep(3)
+                            result = job.get("result", "failed")
+                            why = job.get("why") or result
                     else:
-                        log.warning("poster send fail: %s", data.get("description"))
-                done.add(p["_id"])
-                await store.set(bulk={"chat_id": str(chat_id), "running": True, "done": sorted(done)})
+                        why = (data.get("description") or "send fail")[:60]
+                        log.warning("poster send fail: %s", why)
+                else:
+                    why = "media/file_id nahi"
+
+                if result == "done":
+                    done.add(pid)
+                    failed.pop(pid, None)
+                else:
+                    failed[pid] = why
+                await save()
                 if n % 50 == 0:
-                    await tell(f"📊 {len(done)}/{len(posts)} ho gaye")
+                    await tell(f"📊 {bulk_summary(bulk_get(), len(posts))}")
                 await asyncio.sleep(2)
 
-        await store.set(bulk={"chat_id": str(chat_id), "running": False, "done": sorted(done)})
-        await tell(f"✅ <b>Bulk complete</b>: {len(done)}/{len(posts)}")
+        retry_at = None
+        if failed and RETRY_HOURS > 0 and not stop_at:
+            retry_at = time.time() + RETRY_HOURS * 3600
+        await save(running=False, retry_at=retry_at)
+        extra = ""
+        if failed:
+            extra = (f"\n⏰ Failed posts <b>{RETRY_HOURS:g} ghante</b> baad auto-retry honge, "
+                     "ya abhi /bulkretry bhejo.") if RETRY_HOURS > 0 else "\nRetry ke liye /bulkretry bhejo."
+        if stop_at:
+            stop_at = None
+            await save(running=False, retry_at=retry_at)
+        await tell(f"🏁 <b>Bulk {mode} complete</b>\n{bulk_summary(bulk_get(), len(posts))}{extra}")
     except Exception as e:
         log.exception("bulk failed")
         await tell(f"❌ Bulk error:\n<code>{html.escape(str(e))}</code>\n/bulk dobara bhejo, resume ho jayega.")
 
 
-async def bulk_start(chat_id):
+async def bulk_start(chat_id, mode="main"):
     global bulk_task
     if bulk_task and not bulk_task.done():
         return False
-    bulk_task = asyncio.create_task(bulk_run(chat_id))
+    bulk_task = asyncio.create_task(bulk_run(chat_id, mode))
     return True
+
+
+async def retry_watcher():
+    """Failed posts ka auto-retry (RETRY_HOURS baad)."""
+    while True:
+        await asyncio.sleep(60)
+        try:
+            b = bulk_get()
+            idle = not (bulk_task and not bulk_task.done())
+            if idle and b["failed"] and b.get("retry_at") and time.time() >= b["retry_at"] and b.get("chat_id"):
+                await store.set(bulk={**b, "retry_at": None})
+                await bulk_start(b["chat_id"], "retry")
+        except Exception:
+            log.exception("retry_watcher")
 
 
 # ───────────────────────── Bot handlers ─────────────────────────
@@ -560,25 +701,62 @@ async def on_message(event):
     mode = state["mode"]
 
     if text.startswith("/bulkstop"):
-        b = dict(store.data.get("bulk") or {})
-        b["running"] = False
-        await store.set(bulk=b)
+        b = bulk_get()
+        await store.set(bulk={**b, "running": False})
         await event.reply("⏹ Bulk rokne ka signal bhej diya (current post khatam hone par ruk jayega).")
         return
 
     if text.startswith("/bulkstatus"):
-        b = store.data.get("bulk") or {}
-        await event.reply(f"📊 chat {b.get('chat_id')}: {len(b.get('done', []))} done, running={b.get('running')}")
+        b = bulk_get()
+        posts = load_posts(b.get("chat_id")) if b.get("chat_id") else None
+        total = len(posts) if posts else "?"
+        run = bool(bulk_task and not bulk_task.done())
+        ra = b.get("retry_at")
+        left = f"\n⏰ Auto-retry {max(0, int((ra - time.time()) / 60))} min me" if ra else ""
+        await event.reply(f"📊 chat {b.get('chat_id')} · running={run}\n{bulk_summary(b, total)}{left}")
+        return
+
+    if text.startswith("/bulkreset"):
+        if bulk_task and not bulk_task.done():
+            await event.reply("⚠️ Pehle /bulkstop karke ruk jane do.")
+            return
+        if "confirm" not in text:
+            await event.reply("⚠️ Saara progress hat jayega (jo ho chuke wo dobara honge).\n"
+                              "Pakka? Bhejo: <code>/bulkreset confirm</code>", parse_mode="html")
+            return
+        b = bulk_get()
+        await store.set(bulk={"chat_id": b.get("chat_id"), "running": False, "mode": "main",
+                              "done": list(SEED_DONE), "failed": {}, "retry_at": None})
+        await event.reply(f"🧹 Progress reset. {len(SEED_DONE)} posts (Termux se ho chuke) done maane gaye.\n"
+                          "Ab <code>/bulk -1004471150773</code> bhejo.", parse_mode="html")
+        return
+
+    if text.startswith("/bulkretry"):
+        b = bulk_get()
+        if not b.get("chat_id") or not b["failed"]:
+            await event.reply("Koi failed post nahi hai.")
+            return
+        _, cnt = parse_bulk_args(text)
+        stop = len(b["done"]) + cnt if cnt else None
+        await store.set(bulk={**b, "retry_at": None, "stop_at": stop})
+        ok = await bulk_start(b["chat_id"], "retry")
+        await event.reply(f"🔁 {len(b['failed'])} failed posts retry ho rahe hain…" if ok else "⚠️ Bulk pehle se chal raha hai.")
         return
 
     if text.startswith("/bulk"):
-        parts = text.split()
-        cid = parts[1] if len(parts) > 1 else (store.data.get("bulk") or {}).get("chat_id")
+        cid, cnt = parse_bulk_args(text)
+        cid = cid or bulk_get().get("chat_id")
         if not cid:
-            await event.reply("Use: <code>/bulk -1004471150773</code>", parse_mode="html")
+            await event.reply("Use: <code>/bulk 10</code> ya <code>/bulk -1004471150773 10</code>", parse_mode="html")
             return
-        ok = await bulk_start(cid)
-        await event.reply("🚀 Bulk shuru ho raha hai…" if ok else "⚠️ Bulk pehle se chal raha hai.")
+        b = bulk_get()
+        if str(b.get("chat_id")) != str(cid):
+            b = {"done": list(SEED_DONE) if str(cid) == "-1004471150773" else [], "failed": {}}
+        stop = len(b["done"]) + cnt if cnt else None
+        await store.set(bulk={**b, "chat_id": str(cid), "running": True, "mode": "main", "stop_at": stop})
+        ok = await bulk_start(cid, "main")
+        msg = f"🚀 Bulk shuru: {cnt} download" if cnt else "🚀 Bulk shuru: sab pending posts"
+        await event.reply(msg if ok else "⚠️ Bulk pehle se chal raha hai.")
         return
 
     if text.startswith("/"):
@@ -773,9 +951,10 @@ async def main():
         state["dialogs"] = True
 
     asyncio.create_task(worker())
-    b = store.data.get("bulk") or {}
+    b = bulk_get()
     if b.get("running") and b.get("chat_id"):
-        await bulk_start(b["chat_id"])  # restart ke baad auto-resume
+        await bulk_start(b["chat_id"], b.get("mode", "main"))  # restart ke baad auto-resume
+    asyncio.create_task(retry_watcher())
     try:
         await render()
     except Exception:
