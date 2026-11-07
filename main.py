@@ -19,12 +19,13 @@ import logging
 import os
 import random
 import re
+import secrets
 import time
 
 import aiohttp
 import qrcode
 from aiohttp import web
-from telethon import Button, TelegramClient, events
+from telethon import Button, TelegramClient, events, utils
 from telethon.errors import (
     MessageNotModifiedError,
     PasswordHashInvalidError,
@@ -54,7 +55,7 @@ POSTER_BOT_TOKEN = os.getenv("POSTER_BOT_TOKEN")  # bulk ke liye (poster bot ka 
 BACKUP_FILE = os.getenv("BACKUP_FILE")  # default: repo ki autobackup-*.json
 DATA_FILE = "data.json"
 
-DEFAULTS = {"target": "diskwala_576_bot", "backup": None, "timeout": 180, "session": ""}
+DEFAULTS = {"target": "diskwala_576_bot", "backup": None, "dests": None, "timeout": 180, "session": ""}
 URL_RE = re.compile(r"https?://[^\s<>\"']+")
 # Sirf ye pattern copy hoga. Badalna ho to LINK_PATTERN env var set karo.
 LINK_RE = re.compile(os.getenv("LINK_PATTERN", r"https?://(?:www\.)?diskwala\.com/app/[A-Za-z0-9]+"))
@@ -103,6 +104,15 @@ class Store:
             with open(DATA_FILE) as f:
                 saved = json.load(f)
         self.data = {**DEFAULTS, **saved}
+        if self.data.get("dests") is None:  # purana single "backup" channel -> destinations list
+            self.data["dests"] = []
+            b = saved.get("backup")
+            if b:
+                self.data["dests"].append({
+                    "id": "c1", "kind": "channel", "title": b.get("title") or "Backup",
+                    "pid": utils.get_peer_id(PeerChannel(b["id"])), "username": b.get("username"),
+                    "hash": b.get("hash"), "on": True,
+                })
 
     async def set(self, **kw):
         self.data.update(kw)
@@ -123,9 +133,13 @@ GUIDE = """📖 <b>Kaise use karein</b>
 🔐 <i>QR Login</i> dabao → QR scan karo
 (Telegram → Settings → Devices → Link Desktop Device)
 
-<b>Step 2 — Backup Channel</b>
-📦 <i>Backup Channel</i> dabao → channel ka koi post forward karo
-⚠️ Bot ko channel me <b>Admin</b> banao (post permission) aur apna account bhi member rakho.
+<b>Step 2 — Destinations</b>
+📦 <i>Destinations</i> dabao → ek ya <b>zyada</b> jagah add karo:
+• 💾 <b>Saved Messages</b> (ek tap)
+• 📢 Channel/Group — post forward karo ya @username/link bhejo
+• 💬 Personal chat — naam, @username ya ID bhejo
+Har destination ko tap karke on/off kar sakte ho.
+⚠️ Channel me bot ko <b>Admin</b> banao (nahi to account se forward hoga, account member ho).
 
 <b>Step 3 — Post bhejo</b>
 Photo/Video + caption (jisme link ho) seedha is chat me bhejo.
@@ -133,7 +147,7 @@ Photo/Video + caption (jisme link ho) seedha is chat me bhejo.
 <b>Ab bot khud karega:</b>
 1️⃣ Link tumhare account se target bot ko jayega
 2️⃣ Target bot ka video aane tak wait
-3️⃣ Pehle tumhara post, phir naya video → Backup me forward
+3️⃣ Pehle tumhara post, phir naya video → <b>sab active destinations</b> me forward
 
 🎯 Target bot aur ⏱ timeout menu se badal sakte ho."""
 
@@ -197,21 +211,96 @@ def extract_links(msg):
     return list(dict.fromkeys(links))
 
 
-async def bot_peer():
-    b = store.data["backup"]
-    if b.get("username"):
-        return await bot.get_input_entity(b["username"])
-    return InputPeerChannel(b["id"], b["hash"])
+def active_dests():
+    return [d for d in (store.data.get("dests") or []) if d.get("on", True)]
 
 
-async def user_peer():
-    b = store.data["backup"]
-    if b.get("username"):
-        return await user.get_input_entity(b["username"])
+async def bot_peer(d):
+    if d.get("username"):
+        return await bot.get_input_entity(d["username"])
+    return InputPeerChannel(utils.resolve_id(d["pid"])[0], d["hash"])
+
+
+async def user_peer(d):
+    if d["kind"] == "saved":
+        return await user.get_input_entity("me")
+    if d.get("username"):
+        return await user.get_input_entity(d["username"])
     if not state["dialogs"]:
         await user.get_dialogs()
         state["dialogs"] = True
-    return await user.get_input_entity(PeerChannel(b["id"]))
+    return await user.get_input_entity(d["pid"])
+
+
+async def make_dest(ent, bot_hash=None):
+    """Telethon entity -> destination dict. Channel + bot ko access ho to bot se bhi post jayega."""
+    pid = utils.get_peer_id(ent)
+    h = None
+    if isinstance(ent, Channel):
+        h = bot_hash
+        if h is None and ent.username:
+            try:
+                h = (await bot.get_input_entity(ent.username)).access_hash
+            except Exception:
+                h = None
+    return {
+        "id": secrets.token_hex(3),
+        "kind": "channel" if h is not None else "chat",
+        "title": utils.get_display_name(ent) or str(pid),
+        "pid": pid,
+        "username": getattr(ent, "username", None),
+        "hash": h,
+        "on": True,
+    }
+
+
+async def add_dest(d):
+    """True = add hua, False = pehle se hai."""
+    ds = list(store.data.get("dests") or [])
+    if any(x["pid"] == d["pid"] for x in ds):
+        return False
+    ds.append(d)
+    await store.set(dests=ds)
+    state["dialogs"] = False
+    return True
+
+
+async def find_user_copy(msg):
+    """Control bot chat me tumhare account ki apni copy dhundo (private chat me msg id alag hote hain)."""
+    if not state.get("ctrl"):
+        state["ctrl"] = (await bot.get_me()).username
+    want = (msg.raw_text or "").strip()
+    for _ in range(3):
+        async for m in user.iter_messages(state["ctrl"], limit=20):
+            if (m.out and (m.raw_text or "").strip() == want
+                    and bool(m.video) == bool(msg.video) and bool(m.photo) == bool(msg.photo)):
+                return m
+        await asyncio.sleep(1.5)
+    return None
+
+
+async def find_candidates(q):
+    """@username / link / numeric ID / chat ka naam -> entities (max 8)."""
+    name = re.sub(r"^https?://t\.me/", "", q.strip()).lstrip("@").split("?")[0].strip("/")
+    out = []
+    if not state["dialogs"]:
+        await user.get_dialogs()
+        state["dialogs"] = True
+    try:
+        if re.fullmatch(r"-?\d{5,}", name):
+            out.append(await user.get_entity(int(name)))
+        elif re.fullmatch(r"[A-Za-z0-9_]{4,32}", name):
+            out.append(await user.get_entity(name))
+    except Exception:
+        pass
+    if not out:
+        ql = q.strip().lower()
+        async for dlg in user.iter_dialogs(limit=400):
+            if ql and ql in (dlg.name or "").lower():
+                out.append(dlg.entity)
+                if len(out) >= 8:
+                    break
+    return out
 
 
 # ───────────────────────── Menu ─────────────────────────
@@ -219,14 +308,18 @@ async def menu_view():
     logged = await is_logged()
     d = store.data
     acc = f"✅ {html.escape(state['me'] or 'Connected')}" if logged else "❌ Login nahi hai"
-    bk = d["backup"]
-    bk_txt = html.escape(bk["title"]) if bk else "❌ Set nahi hai"
+    act = active_dests()
+    if act:
+        names = ", ".join(html.escape(x["title"]) for x in act[:3]) + (f" +{len(act) - 3}" if len(act) > 3 else "")
+        bk_txt = f"{len(act)} active — {names}"
+    else:
+        bk_txt = "❌ Set nahi hai"
     pending = queue.qsize() + (1 if state["busy"] else 0)
     text = (
         "🤖 <b>Auto Link Forwarder</b>\n\n"
         f"👤 <b>Account:</b> {acc}\n"
         f"🎯 <b>Target Bot:</b> @{html.escape(d['target'])}\n"
-        f"📦 <b>Backup:</b> {bk_txt}\n"
+        f"📦 <b>Destinations:</b> {bk_txt}\n"
         f"⏱ <b>Timeout:</b> {d['timeout']}s\n"
         f"📥 <b>Queue:</b> {pending}\n\n"
         "➡️ Post (photo/video + link caption) bhejo, baaki main sambhal lunga."
@@ -238,7 +331,7 @@ async def menu_view():
     )
     btns = [
         [first],
-        [Button.inline("🎯 Target Bot", b"target"), Button.inline("📦 Backup Channel", b"backup")],
+        [Button.inline("🎯 Target Bot", b"target"), Button.inline("📦 Destinations", b"dests")],
         [Button.inline("⏱ Timeout", b"timeout"), Button.inline("📖 Guide", b"guide")],
         [Button.inline("🔄 Refresh", b"menu")],
     ]
@@ -442,15 +535,59 @@ async def run_job(msg, st, job):
         )
         return
 
-    await status("📤 Backup channel me forward ho raha hai…")
-    await fwd(bot, msg, await bot_peer())  # post: caption rahega, tag nahi
-    peer = await user_peer()
-    for v in videos:
-        await fwd(user, v, peer, drop_caps=True)  # video: caption + tag dono nahi
+    dests = active_dests()
+    if not dests:
+        job["result"] = "failed"
+        job["why"] = "destination nahi"
+        await status(
+            "⚠️ <b>Koi active destination nahi hai</b>\nVideo mil gaya par kahin forward nahi hua.",
+            [[Button.inline("📦 Destinations", b"dests")], home_btn()],
+        )
+        return
+
+    ok, bad, post_missing, user_copy = [], [], 0, None
+    for n, d in enumerate(dests, 1):
+        await status(f"📤 <b>Forward {n}/{len(dests)}</b>\n{html.escape(d['title'])}…")
+        try:
+            posted = False
+            if d["kind"] == "channel":  # bot se: caption rahega, tag nahi
+                try:
+                    await fwd(bot, msg, await bot_peer(d))
+                    posted = True
+                except Exception as e:
+                    log.warning("bot forward fail (%s): %s", d["title"], e)
+            peer = await user_peer(d)
+            if not posted:  # saved / personal chat / bot-admin nahi: account se forward
+                if user_copy is None:
+                    user_copy = await find_user_copy(msg) or False
+                if user_copy:
+                    await fwd(user, user_copy, peer)
+                    posted = True
+            if not posted:
+                post_missing += 1
+            for v in videos:
+                await fwd(user, v, peer, drop_caps=True)  # video: caption + tag dono nahi
+                await asyncio.sleep(1)
+            ok.append(d["title"])
+        except Exception as e:
+            log.exception("forward failed: %s", d["title"])
+            bad.append((d["title"], str(e)[:60]))
         await asyncio.sleep(1)
 
+    if not ok:
+        job["result"] = "failed"
+        job["why"] = "forward fail"
+        reasons = "\n".join(f"• {html.escape(t)}: <code>{html.escape(r)}</code>" for t, r in bad)
+        await status(f"❌ <b>Error</b> — kisi destination me forward nahi hua\n\n{reasons}", [home_btn()])
+        return
+
     job["result"] = "done"
-    text = f"✅ <b>Backup complete!</b>\n📝 1 post + 🎬 {len(videos)} video forward ho gaye."
+    text = f"✅ <b>Backup complete!</b>\n📝 1 post + 🎬 {len(videos)} video → {len(ok)}/{len(dests)} destination"
+    text += "\n\n" + "\n".join(f"✅ {html.escape(t)}" for t in ok)
+    for t, r in bad:
+        text += f"\n❌ {html.escape(t)} — <code>{html.escape(r)}</code>"
+    if post_missing:
+        text += f"\n\n⚠️ {post_missing} jagah post nahi gaya (account me post ki copy nahi mili), sirf video gaye."
     if skipped:
         text += f"\n\n⏭ {len(skipped)} link skip hue ({', '.join(sorted(set(skipped)))})."
     await status(text, [home_btn()])
@@ -475,7 +612,7 @@ async def worker():
             try:
                 await st.edit(
                     f"❌ <b>Error</b>\n<code>{html.escape(str(e))}</code>\n\n"
-                    "Check karo: bot channel me admin hai? Account login hai?",
+                    "Check karo: destination sahi hai? Bot channel me admin hai? Account login hai?",
                     buttons=[home_btn()],
                     parse_mode="html",
                 )
@@ -541,8 +678,8 @@ async def bulk_run(chat_id, mode="main"):
     try:
         if not POSTER_BOT_TOKEN:
             return await tell("❌ Render env <b>POSTER_BOT_TOKEN</b> set nahi hai.")
-        if not await is_logged() or not store.data["backup"]:
-            return await tell("❌ Pehle QR Login aur Backup Channel set karo.")
+        if not await is_logged() or not active_dests():
+            return await tell("❌ Pehle QR Login aur kam se kam ek Destination set karo.")
         posts = load_posts(chat_id)
         if posts is None:
             return await tell("❌ Backup JSON file repo me nahi mili.")
@@ -671,10 +808,10 @@ async def handle_post(event):
             buttons=[[Button.inline("🔐 QR Login", b"login")]],
         )
         return
-    if not store.data["backup"]:
+    if not active_dests():
         await event.reply(
-            "📦 Pehle Backup Channel set karo.",
-            buttons=[[Button.inline("📦 Backup Channel", b"backup")]],
+            "📦 Pehle Destination add karo (kam se kam ek active).",
+            buttons=[[Button.inline("📦 Destinations", b"dests")]],
         )
         return
     if not extract_links(msg):
@@ -692,6 +829,75 @@ async def handle_post(event):
         buttons=[[Button.inline("❌ Cancel", f"cancel_{job['id']}".encode())], home_btn()],
     )
     await queue.put((msg, st, job))
+
+
+async def show_dests(event=None):
+    state["mode"] = None
+    text, btns = dests_view()
+    if event is not None:
+        try:
+            await event.edit(text, buttons=btns, parse_mode="html")
+            return
+        except MessageNotModifiedError:
+            return
+        except Exception:
+            pass
+    await bot.send_message(OWNER_ID, text, buttons=btns, parse_mode="html")
+
+
+def dests_view():
+    ds = store.data.get("dests") or []
+    icon = {"saved": "💾", "channel": "📢", "chat": "💬"}
+    lines = [f"{'✅' if d['on'] else '⏸'} {icon.get(d['kind'], '📦')} {html.escape(d['title'])}" for d in ds]
+    text = (
+        "📦 <b>Destinations</b>\n\n"
+        "Post + videos in sab jagah forward honge (✅ wale):\n\n"
+        + ("\n".join(lines) if lines else "<i>Abhi koi destination nahi hai.</i>")
+        + "\n\n👆 Tap = on/off · 🗑 = hatao"
+    )
+    btns = []
+    for d in ds:
+        btns.append([
+            Button.inline(f"{'✅' if d['on'] else '⏸'} {d['title'][:26]}", f"dt_{d['id']}".encode()),
+            Button.inline("🗑", f"dd_{d['id']}".encode()),
+        ])
+    btns.append([Button.inline("➕ Channel / Chat", b"dadd"), Button.inline("💾 Saved Messages", b"dsaved")])
+    btns.append(home_btn())
+    return text, btns
+
+
+async def handle_add_dest(event, text):
+    back = [[Button.inline("❌ Cancel", b"dests")]]
+    f = event.message.forward
+    chat = f.chat if f and f.chat else None
+    if isinstance(chat, Channel):  # channel ka post forward kiya (bot ko access milta hai)
+        d = await make_dest(chat, bot_hash=chat.access_hash)
+        fresh = await add_dest(d)
+        await event.reply(f"✅ Add hua: <b>{html.escape(d['title'])}</b>" if fresh else "ℹ️ Ye pehle se list me hai.", parse_mode="html")
+        return await show_dests()
+    if not text:
+        await event.reply("Channel ka post forward karo, ya @username / link / ID / chat ka naam bhejo.", buttons=back)
+        return
+    if not await is_logged():
+        await event.reply("🔐 Personal chat/group ke liye pehle QR Login karo.", buttons=[[Button.inline("🔐 QR Login", b"login")], home_btn()])
+        return
+    try:
+        cands = await find_candidates(text)
+    except Exception as e:
+        await event.reply(f"❌ Search fail: <code>{html.escape(str(e))}</code>", buttons=back, parse_mode="html")
+        return
+    if not cands:
+        await event.reply("❌ Kuch nahi mila. Naam ka thoda hissa, @username ya numeric ID try karo.", buttons=back)
+    elif len(cands) == 1:
+        d = await make_dest(cands[0])
+        fresh = await add_dest(d)
+        await event.reply(f"✅ Add hua: <b>{html.escape(d['title'])}</b>" if fresh else "ℹ️ Ye pehle se list me hai.", parse_mode="html")
+        await show_dests()
+    else:
+        state["cands"] = cands
+        rows = [[Button.inline(f"{'💬' if not isinstance(c, Channel) else '📢'} {(utils.get_display_name(c) or str(c.id))[:30]}", f"dpick_{i}".encode())]
+                for i, c in enumerate(cands)]
+        await event.reply("Kaun sa chat add karna hai?", buttons=rows + back)
 
 
 async def on_message(event):
@@ -781,31 +987,8 @@ async def on_message(event):
         await render()
         return
 
-    if mode == "set_backup":
-        try:
-            fwd = event.message.forward
-            chat = fwd.chat if fwd and fwd.chat else None
-            if chat is None and text:
-                chat = await bot.get_entity(text.replace("https://t.me/", "").lstrip("@"))
-            if not isinstance(chat, Channel):
-                raise ValueError("Ye channel/supergroup nahi lag raha.")
-            await store.set(
-                backup={
-                    "id": chat.id,
-                    "hash": chat.access_hash,
-                    "username": chat.username,
-                    "title": chat.title,
-                }
-            )
-            state["dialogs"] = False
-            await event.reply(f"✅ Backup set: <b>{html.escape(chat.title)}</b>", parse_mode="html")
-            await render()
-        except Exception as e:
-            await event.reply(
-                f"❌ Channel nahi mila.\n<code>{html.escape(str(e))}</code>\n\n"
-                "Channel ka koi post forward karo ya @username bhejo.",
-                parse_mode="html",
-            )
+    if mode == "add_dest":
+        await handle_add_dest(event, text)
         return
 
     await handle_post(event)
@@ -895,15 +1078,54 @@ async def on_callback(event):
         await event.answer("Default set ✅")
         await render(event)
 
-    elif d == "backup":
-        state["mode"] = "set_backup"
+    elif d == "dests":
+        await event.answer()
+        await show_dests(event)
+
+    elif d == "dadd":
+        state["mode"] = "add_dest"
         await event.edit(
-            "📦 <b>Backup Channel</b>\n\n"
-            "Channel ka <b>koi bhi post yahan forward karo</b>, ya channel ka <b>@username</b> bhejo.\n\n"
-            "⚠️ Bot ko channel me Admin banao (post permission) aur apna account bhi member rakho.",
-            buttons=[cancel],
+            "➕ <b>Destination add karo</b>\n\n"
+            "• 📢 Channel ka <b>koi post forward karo</b>\n"
+            "• ya <b>@username / t.me link / numeric ID</b> bhejo\n"
+            "• ya personal chat/group ka <b>naam</b> likho (search hoga)\n\n"
+            "💡 Channel me bot ko Admin banao. Personal chat/Saved ke liye account login hona chahiye.",
+            buttons=[[Button.inline("❌ Cancel", b"dests")]],
             parse_mode="html",
         )
+
+    elif d == "dsaved":
+        fresh = await add_dest({"id": "saved", "kind": "saved", "title": "Saved Messages", "pid": "saved",
+                                "username": None, "hash": None, "on": True})
+        await event.answer("Saved Messages add ✅" if fresh else "Pehle se add hai")
+        await show_dests(event)
+
+    elif d.startswith("dpick_"):
+        cands = state.get("cands") or []
+        i = int(d[6:])
+        if i >= len(cands):
+            await event.answer("List purani ho gayi, dobara search karo", alert=True)
+            return
+        nd = await make_dest(cands[i])
+        fresh = await add_dest(nd)
+        state["cands"] = []
+        await event.answer("Add ho gaya ✅" if fresh else "Pehle se hai")
+        await show_dests(event)
+
+    elif d.startswith("dt_"):
+        ds = store.data.get("dests") or []
+        for x in ds:
+            if x["id"] == d[3:]:
+                x["on"] = not x.get("on", True)
+        await store.set(dests=ds)
+        await event.answer("Update ✅")
+        await show_dests(event)
+
+    elif d.startswith("dd_"):
+        ds = [x for x in (store.data.get("dests") or []) if x["id"] != d[3:]]
+        await store.set(dests=ds)
+        await event.answer("Hata diya 🗑")
+        await show_dests(event)
 
     elif d == "timeout":
         cur = store.data["timeout"]
