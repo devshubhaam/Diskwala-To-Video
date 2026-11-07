@@ -36,7 +36,7 @@ CONTROL = os.environ["CONTROL_BOT"].lstrip("@")
 OWNER_ID = int(os.environ["OWNER_ID"])
 
 DONE_RE = re.compile(r"Backup complete|Koi video nahi|Error|Cancel ho gaya|nahi mila|Pehle", re.I)
-ABORT_RE = re.compile(r"Pehle account login|Pehle Backup Channel", re.I)
+ABORT_RE = re.compile(r"Pehle account login|Pehle Backup Channel|Pehle Destination", re.I)
 PER_POST_TIMEOUT = 20 * 60  # seconds
 DISKWALA = re.compile(r"diskwala\.com/app/", re.I)
 
